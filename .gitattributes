@@ -1,0 +1,12 @@
+# Normalise line endings in the repository so every OS checks out the same bytes.
+* text=auto eol=lf
+
+# Keep these binary-free and LF regardless of platform tooling.
+*.ts text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
