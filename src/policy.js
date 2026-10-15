@@ -16,6 +16,11 @@ export const DEFAULTS = {
   /** OpenCode 1's RETRY_MAX_RETRIES. */
   maxAttempts: 5,
   verbose: false,
+  /**
+   * Absolute path for the diagnostic JSONL file. Defaults to the platform data directory beside
+   * `opencode.log`. Diagnostics are always written; this only changes where they land.
+   */
+  diagnosticsFile: undefined,
 }
 
 /** Providers only send these when the same request can succeed a little later. */
@@ -83,11 +88,15 @@ function clampDelay(delay, maxDelayMs) {
   return Math.max(MIN_DELAY_MS, Math.min(Math.ceil(delay), maxDelayMs))
 }
 
+const accept = (delay, reason) => ({ retry: true, delay, reason })
+const decline = (reason) => ({ retry: false, reason })
+
 /**
- * Decides whether to force a retry that OpenCode 2 would not perform itself.
+ * Decides whether to force a retry that OpenCode 2 would not perform itself, and says why.
  *
- * Returns undefined whenever OpenCode's own decision should stand, which keeps its backoff,
- * jitter and per-step budget authoritative everywhere this plugin has no opinion.
+ * Every exit is labelled. A decline is silent by design at runtime, which is exactly why an
+ * unexplained terminal failure is so hard to diagnose: nothing distinguishes "not a throttle"
+ * from "provider told us to stop" from "budget spent". `reason` closes that gap.
  *
  * @param {{
  *   attempt: number,
@@ -98,20 +107,22 @@ function clampDelay(delay, maxDelayMs) {
  *   hint?: { delay: number, blocked: boolean } | undefined,
  * }} failure
  * @param {Partial<typeof DEFAULTS>} [options]
- * @returns {{ retry: true, delay: number } | undefined}
+ * @returns {{ retry: true, delay: number, reason: string } | { retry: false, reason: string }}
  */
 export function decide(failure, options = {}) {
   const settings = { ...DEFAULTS, ...options }
-  if (failure.alreadyRetrying) return undefined
-  if (failure.status !== 429) return undefined
-  if (!(failure.attempt <= settings.maxAttempts)) return undefined
+  if (failure.alreadyRetrying) return decline("opencode-already-retrying")
+  if (failure.status !== 429) return decline("not-http-429")
+  if (!(failure.attempt <= settings.maxAttempts)) return decline("attempt-budget-spent")
 
   const hint = failure.hint
-  if (hint?.blocked) return undefined
-
-  if (hint && hint.delay > 0) return { retry: true, delay: clampDelay(hint.delay, settings.maxDelayMs) }
+  if (hint?.blocked) return decline("provider-said-do-not-retry")
+  if (hint && hint.delay > 0) return accept(clampDelay(hint.delay, settings.maxDelayMs), "provider-advertised-wait")
 
   const text = `${failure.message ?? ""}\n${failure.body ?? ""}`
-  if (!looksThrottled(text)) return undefined
-  return { retry: true, delay: clampDelay(backoffDelay(failure.attempt, settings.maxDelayMs), settings.maxDelayMs) }
+  if (!looksThrottled(text)) return decline("text-not-throttle-like")
+  return accept(
+    clampDelay(backoffDelay(failure.attempt, settings.maxDelayMs), settings.maxDelayMs),
+    "exponential-backoff",
+  )
 }
