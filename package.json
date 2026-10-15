@@ -1,6 +1,6 @@
 {
   "name": "opencode-ratelimit-retry",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode plugin that restores 1.x behaviour: automatically retry provider rate limits instead of ending the turn with a bare error.",
   "license": "MIT",
   "type": "module",
