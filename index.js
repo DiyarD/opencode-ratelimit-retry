@@ -558,8 +558,15 @@ export default Plugin.define({
         const episode = episodes.get(sessionID)
         if (!episode) return
         if (reason === "inactivity") {
-          const entry = await identifyAsync(sessionID)
-          if (entry.subagent && !options.continueSubagents) {
+          // Deliberately not `identifyAsync`: a small await is not small here. The sweep settles
+          // the interrupt, re-checks whether anything owns the location, and evicts it if not -
+          // and this instance lives in that location's scope. An awaited lookup is the exact window
+          // in which the instance is torn down, taking the resume with it (observed in a TTL-
+          // shortened build: no record at all after the episode opened). The cached identity
+          // answers what it can, and an unresolved one fails open, because losing the turn is the
+          // worse error.
+          const entry = identify(sessionID)
+          if (entry.resolved && entry.subagent && !options.continueSubagents) {
             closeEpisode(sessionID, "subagent-interrupted", {
               note: "continueSubagents is off: an interrupted child is its parent's to deal with",
             })

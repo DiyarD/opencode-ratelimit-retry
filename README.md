@@ -111,6 +111,11 @@ and gets a fresh `retry-after` from the provider. The window is covered by a seq
 instead of one wait that outlives the session. Every one of those waits is logged, so the paced
 number and the provider's number are always distinguishable.
 
+The ceiling also keeps the plugin off a path it can lose. An interrupt from the sweep evicts the
+location the plugin instance lives in, so a rescue after the fact is a race against that teardown —
+the plugin sends its continuation without awaiting anything first to have any chance at all, but
+prevention is the reliable answer, and the ceiling is the prevention.
+
 ## Continuation
 
 One step only retries `Schedule.recurs(10)` times (`session/runner/retry.ts`), so ten forced waits —
@@ -210,7 +215,7 @@ its budget:
 | Reason | Meaning |
 | --- | --- |
 | `step-budget-spent` | The step failed with the throttle still in force; a continuation is scheduled. |
-| `recovery-after-interrupt` | The session was killed by the inactivity sweep rather than by a failure (a suspended machine, say) while it was being deferred; the same continuation recovers it. |
+| `recovery-after-interrupt` | The session was killed by the inactivity sweep rather than by a failure (a suspended machine, say) while it was being deferred. The same continuation is sent immediately, without awaiting anything first, to give it any chance of landing before the location is evicted — a race it usually loses (see the walkthrough in [If a limit retried and then died anyway](#if-a-limit-retried-and-then-died-anyway)). |
 | `continuation-budget-spent` | `maxContinuations` is reached, so the episode ends instead of looping. |
 | `continuation-disabled` | `continueAfterBudget` is off. |
 | `turn-failed-not-throttle` | The step died of something else, so it is left alone. |
@@ -240,7 +245,13 @@ Work backwards from the failure in the diagnostic file:
    framework log means a single wait outlived the directory's activity timer. That can only happen
    if `maxDelayMs` was raised past 60 minutes (there would be a
    `config.max-delay-above-inactivity-ttl` record at setup saying so), or if the machine was
-   suspended mid-wait. The plugin treats the second case as recoverable and continues the turn.
+   suspended mid-wait. The plugin answers with the same continuation immediately, without awaiting
+   anything first, but the sweep then evicts the location the instance lives in — and measured runs
+   lost that race both times: the `plugin.dispose` record carries `openEpisodes: 1` with the
+   session, and no `continuation.sent` follows, because the instance was gone before the interrupt
+   reached it. A `continuation.sent` right after the interrupt means the race was won after all
+   (something else kept the location alive); without it the turn has to be prompted again. The
+   ceiling exists so that only a suspend can reach this path at all.
 6. **Was it a restart?** A forced retry is an in-process sleep, so if the server restarts during the
    wait the retry is lost; `SessionRestart` then recovers the turn itself, with a budget of 10
    attempts before terminalising it with "Execution was interrupted repeatedly and will not be
