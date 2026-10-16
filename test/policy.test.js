@@ -1,7 +1,19 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { DEFAULTS, backoffDelay, decide, looksThrottled, parseRetryAfter } from "../src/policy.js"
+import {
+  DEFAULTS,
+  FRAMEWORK_MAX_ATTEMPTS,
+  INACTIVITY_TTL_MS,
+  MAX_SAFE_DELAY_MS,
+  MIN_CONTINUATION_WAIT_MS,
+  backoffDelay,
+  continuationDecision,
+  decide,
+  failureIsThrottle,
+  looksThrottled,
+  parseRetryAfter,
+} from "../src/policy.js"
 import { createLogger, errorOf, headersOf, safe, MAX_BYTES } from "../src/diagnostics.js"
 
 const headers = (init) => new Headers(init)
@@ -78,16 +90,36 @@ test("a quota failure with an advertised wait is retried", () => {
     body: '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}',
     hint: { delay: 64_673_000, blocked: false },
   })
-  assert.deepEqual(decision, { retry: true, delay: 64_673_000, reason: "provider-advertised-wait" })
+  assert.deepEqual(decision, {
+    retry: true,
+    delay: DEFAULTS.maxDelayMs,
+    reason: "provider-advertised-wait-paced-to-safe-ceiling",
+    advertisedDelayMs: 64_673_000,
+  })
 })
 
-test("an advertised wait is passed through, not clamped to the ceiling", () => {
-  // Zen advertises seconds until midnight. Capping this at the 24h ceiling would change nothing,
-  // but clamping to a shorter ceiling must visibly shorten the wait.
-  assert.equal(DEFAULTS.maxDelayMs, 86_400_000)
-  const decision = decide({ attempt: 1, status: 429, message: "Rate limit exceeded.", hint: { delay: 64_673_000 } }, { maxDelayMs: 900_000 })
+test("the wait ceiling stays clear of the directory inactivity timer", () => {
+  // A wait longer than the timer gets the session interrupted mid-sleep, and the interrupt is
+  // caused by the wait itself. So the ceiling is not a preference: it has to leave headroom for
+  // the request that refreshes the timer.
+  assert.equal(DEFAULTS.maxDelayMs, MAX_SAFE_DELAY_MS)
+  assert.ok(MAX_SAFE_DELAY_MS < INACTIVITY_TTL_MS, "the ceiling must sit below the timer")
+  assert.ok(INACTIVITY_TTL_MS - MAX_SAFE_DELAY_MS >= 5 * 60_000, "at least five minutes of headroom")
+})
+
+test("an advertised wait below the ceiling is honoured exactly", () => {
+  const decision = decide({ attempt: 1, status: 429, message: "Rate limit exceeded.", hint: { delay: 900_000 } })
   assert.equal(decision.retry, true)
   assert.equal(decision.delay, 900_000)
+  assert.equal(decision.reason, "provider-advertised-wait")
+  assert.equal(decision.advertisedDelayMs, 900_000)
+})
+
+test("an advertised wait above the ceiling is paced, and the log shows both numbers", () => {
+  const decision = decide({ attempt: 1, status: 429, message: "Rate limit exceeded.", hint: { delay: 64_673_000 } })
+  assert.equal(decision.delay, DEFAULTS.maxDelayMs)
+  assert.equal(decision.advertisedDelayMs, 64_673_000)
+  assert.notEqual(decision.delay, decision.advertisedDelayMs)
 })
 
 test("a wait of zero falls back to backoff, so a hard cap is not retried", () => {
@@ -110,8 +142,16 @@ test("a provider that says do not retry is obeyed", () => {
 
 test("retries stop at the attempt budget", () => {
   const failure = { attempt: 6, status: 429, message: "Rate limit exceeded.", hint: { delay: 1000, blocked: false } }
-  assert.equal(decide(failure).retry, false)
-  assert.equal(decide({ ...failure, attempt: 5 }).retry, true)
+  assert.equal(decide(failure, { maxAttempts: 5 }).retry, false)
+  assert.equal(decide({ ...failure, attempt: 5 }, { maxAttempts: 5 }).retry, true)
+})
+
+test("the attempt budget cannot exceed what the framework will ask about", () => {
+  // session/runner/retry.ts builds its schedule as Schedule.recurs(10) and consults the retry hook
+  // once per recurrence, so attempts 2 through 11 are the whole conversation. A larger budget can
+  // never be acted on, and the continuation is what covers the window past it.
+  assert.equal(DEFAULTS.maxAttempts, FRAMEWORK_MAX_ATTEMPTS)
+  assert.equal(FRAMEWORK_MAX_ATTEMPTS, 11)
 })
 
 test("every forced delay is at least one second", () => {
@@ -119,6 +159,7 @@ test("every forced delay is at least one second", () => {
     retry: true,
     delay: 1000,
     reason: "provider-advertised-wait",
+    advertisedDelayMs: 1,
   })
 })
 
@@ -145,6 +186,71 @@ test("an accepted decision reports which strategy chose the delay", () => {
     "provider-advertised-wait",
   )
   assert.equal(decide({ attempt: 2, status: 429, message: "Too Many Requests" }).reason, "exponential-backoff")
+})
+
+const episode = (overrides = {}) => ({
+  sessionID: "ses_test",
+  openedAt: 1_000,
+  lastSeenAt: 1_000,
+  deadlineAt: 0,
+  phases: 0,
+  refreshes: 0,
+  failedAt: 2_000,
+  ...overrides,
+})
+
+test("a failure with no open episode is never continued", () => {
+  // The episode is the whole guard: without one the failure had nothing to do with a throttle
+  // this plugin was pacing, and a continuation would hide the real problem.
+  assert.deepEqual(continuationDecision(undefined), { continue: false, reason: "no-open-episode" })
+})
+
+test("a step that runs out of budget while the window is open continues the turn", () => {
+  const outcome = continuationDecision(episode())
+  assert.equal(outcome.continue, true)
+  assert.equal(outcome.waitMs, DEFAULTS.maxDelayMs)
+  assert.equal(outcome.reason, "step-budget-spent")
+})
+
+test("a continuation never waits longer than the retry cadence", () => {
+  // The provider's window is a deadline, not a promise: an early close has to be caught by asking
+  // again, not by sleeping until the provider's own estimate of when it ends.
+  const now = 1_000_000
+  const outcome = continuationDecision(episode({ deadlineAt: now + 20 * 60 * 60_000 }), {}, now)
+  assert.equal(outcome.continue, true)
+  assert.equal(outcome.waitMs, DEFAULTS.maxDelayMs)
+})
+
+test("a closing window shortens the wait, and a passed deadline still waits", () => {
+  const now = 1_000_000
+  assert.equal(continuationDecision(episode({ deadlineAt: now + 120_000 }), {}, now).waitMs, 120_000)
+  assert.equal(continuationDecision(episode({ deadlineAt: now - 60_000 }), {}, now).waitMs, MIN_CONTINUATION_WAIT_MS)
+})
+
+test("a continuation never waits past the inactivity timer either", () => {
+  // The pending timer lives in the same instance whose directory can be evicted after the
+  // inactivity timer expires, so a longer wait is a continuation that might never arrive.
+  const outcome = continuationDecision(episode(), { continuationWaitMs: 6 * 60 * 60_000 })
+  assert.equal(outcome.continue, true)
+  assert.equal(outcome.waitMs, MAX_SAFE_DELAY_MS)
+})
+
+test("continuations are bounded, so a permanently throttled provider cannot loop", () => {
+  assert.equal(continuationDecision(episode({ phases: DEFAULTS.maxContinuations })).continue, false)
+  assert.equal(continuationDecision(episode({ phases: DEFAULTS.maxContinuations })).reason, "continuation-budget-spent")
+  assert.equal(continuationDecision(episode({ phases: 3 }), { maxContinuations: 10 }).continue, true)
+})
+
+test("continuation can be turned off entirely", () => {
+  assert.equal(continuationDecision(episode(), { continueAfterBudget: false }).reason, "continuation-disabled")
+})
+
+test("only a throttle failure is continued", () => {
+  assert.equal(failureIsThrottle({ type: "provider.quota", message: "Rate limit exceeded." }), true)
+  assert.equal(failureIsThrottle({ type: "provider.unknown", message: "Too Many Requests" }), true)
+  assert.equal(failureIsThrottle({ type: "provider.unknown", message: "Your plan expired" }), false)
+  assert.equal(failureIsThrottle({ type: "tool.error", message: "build failed" }), false)
+  assert.equal(failureIsThrottle(undefined), false)
 })
 
 test("diagnostics write structured lines that survive unserialisable fields", async () => {
